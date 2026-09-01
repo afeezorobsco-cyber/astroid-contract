@@ -591,3 +591,141 @@ fn frozen_registry_blocks_grants_and_delegated_writes() {
     client.revoke_role(&owner, &org, &delegate);
     assert_eq!(client.get_role(&org, &delegate), None);
 }
+
+// --- registry-gated upgrades ---
+
+/// Two independent registry instances: `registry` plays the protocol registry
+/// that authorizes implementations, `member` plays a contract being upgraded
+/// (every member contract carries the same three upgrade entrypoints).
+struct UpgradeHarness {
+    env: Env,
+    registry: RegistryContractClient<'static>,
+    registry_id: Address,
+    member: RegistryContractClient<'static>,
+    admin: Address,
+}
+
+fn setup_upgrade() -> UpgradeHarness {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+
+    let registry_id = env.register_contract(None, RegistryContract);
+    let registry = RegistryContractClient::new(&env, &registry_id);
+    registry.initialize(&admin);
+
+    let member_id = env.register_contract(None, RegistryContract);
+    let member = RegistryContractClient::new(&env, &member_id);
+    member.initialize(&admin);
+
+    UpgradeHarness {
+        env,
+        registry,
+        registry_id,
+        member,
+        admin,
+    }
+}
+
+fn hash(env: &Env, seed: u8) -> soroban_sdk::BytesN<32> {
+    soroban_sdk::BytesN::from_array(env, &[seed; 32])
+}
+
+#[test]
+fn upgrade_authority_is_recorded_and_readable() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    let authority = h.member.get_upgrade_authority();
+    assert_eq!(authority.admin, h.admin);
+    assert_eq!(authority.registry, h.registry_id);
+}
+
+#[test]
+fn upgrade_needs_a_configured_authority() {
+    let h = setup_upgrade();
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::NotInitialized))
+    );
+}
+
+#[test]
+fn upgrade_to_an_unapproved_hash_is_refused() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    // Nothing has been approved for this kind, so the registry says no.
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn upgrade_requires_the_recorded_admin() {
+    let h = setup_upgrade();
+    let stranger = Address::generate(&h.env);
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    // Approved in the registry, but the caller is not the upgrade admin.
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
+    assert_eq!(
+        h.member.try_upgrade(&stranger, &hash(&h.env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn approval_is_scoped_to_the_module_kind() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    // Approved for a different kind than the member reports, so it must not
+    // satisfy this member's gate.
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Wallet, &hash(&h.env, 1));
+    assert!(h
+        .registry
+        .is_wasm_approved(&ModuleKind::Wallet, &hash(&h.env, 1)));
+    assert!(!h
+        .registry
+        .is_wasm_approved(&ModuleKind::Organization, &hash(&h.env, 1)));
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn a_revoked_hash_stops_authorizing_upgrades() {
+    let h = setup_upgrade();
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    h.registry
+        .add_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
+    h.registry
+        .remove_approved_wasm(&h.admin, &ModuleKind::Organization, &hash(&h.env, 1));
+    assert_eq!(
+        h.member.try_upgrade(&h.admin, &hash(&h.env, 1)),
+        Err(Ok(Error::Unauthorized))
+    );
+}
+
+#[test]
+fn only_the_current_admin_can_rotate_the_authority() {
+    let h = setup_upgrade();
+    let stranger = Address::generate(&h.env);
+    h.member
+        .set_upgrade_authority(&h.admin, &h.admin, &h.registry_id);
+    assert_eq!(
+        h.member
+            .try_set_upgrade_authority(&stranger, &stranger, &h.registry_id),
+        Err(Ok(Error::Unauthorized))
+    );
+    // The incumbent may hand the role over.
+    h.member
+        .set_upgrade_authority(&h.admin, &stranger, &h.registry_id);
+    assert_eq!(h.member.get_upgrade_authority().admin, stranger);
+}

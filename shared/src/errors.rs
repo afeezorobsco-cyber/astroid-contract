@@ -28,11 +28,12 @@ pub enum Error {
     PolicyDenied = 20,
     EmergencyLock = 21,
     PolicyRecipientRestricted = 22,
-    PolicyMerchantBlocked = 23,
-    PolicyCategoryRestricted = 24,
-    AssetNotWhitelisted = 25,
+    /// The asset is not in the organization's whitelist.
+    AssetNotWhitelisted = 24,
     /// A proposed spend would breach a per-asset spending allowance.
-    PolicyAllowanceExceeded = 26,
+    PolicyAllowanceExceeded = 25,
+    /// A conditional policy rule denied the transaction.
+    RuleDenied = 26,
 
     // --- Registry (30-39) ---
     RegistryFrozen = 30,
@@ -50,6 +51,7 @@ pub enum Error {
     WalletArchived = 51,
     WalletPaused = 52,
     InvalidState = 53,
+    UnauthorizedDispatch = 54,
 
     // --- Multisig / approvals (61-69, 90-92) ---
     ThresholdNotMet = 61,
@@ -83,12 +85,16 @@ pub enum Error {
     /// A declared dependency would close a cycle in the dependency graph.
     CircularDependencyDetected = 79,
 
-    // --- Escrow (80-82) ---
-    EscrowExpired = 80,
+    // --- Escrow (81-82) ---
     TimeLockActive = 81,
     GraceActive = 82,
 
     // --- Treasury allowances (83-84) ---
     AllowanceExceeded = 83,
     AllowanceExpired = 84,
+
+    // --- Interface versioning (95-99) ---
+    /// The remote contract's interface version is older than the minimum
+    /// required by the caller, or otherwise incompatible.
+    InterfaceVersionMismatch = 95,
 }

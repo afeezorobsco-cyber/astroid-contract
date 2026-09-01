@@ -2,7 +2,9 @@
 extern crate std;
 
 use crate::access::Role;
-use crate::{WalletContract, WalletContractClient};
+use crate::{
+    WalletAction, WalletContract, WalletContractClient, WalletTransferAction, WalletWithdrawAction,
+};
 use astroid_shared::errors::Error;
 use astroid_shared::types::ResourceState;
 use soroban_sdk::testutils::Address as _;
@@ -242,6 +244,126 @@ fn standard_events_emitted() {
 
     h.client.freeze(&owner, &id);
     assert_event(&h.env, "WalletStateChanged");
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch authorization tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dispatch_owner_can_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer(WalletTransferAction {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 250,
+    });
+    h.client.dispatch(&owner, &id, &action);
+
+    assert_eq!(h.client.balance(&id, &h.token), 750);
+    assert_eq!(token_balance(&h, &recipient), 250);
+}
+
+#[test]
+fn dispatch_owner_can_freeze_and_unfreeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Freeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Frozen);
+
+    h.client.dispatch(&owner, &id, &WalletAction::Unfreeze);
+    assert_eq!(h.client.get_wallet(&id).state, ResourceState::Active);
+}
+
+#[test]
+fn dispatch_unregistered_caller_blocked() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Transfer(WalletTransferAction {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    });
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_freeze() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let res = h.client.try_dispatch(&stranger, &id, &WalletAction::Freeze);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_unregistered_cannot_withdraw() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let stranger = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    let action = WalletAction::Withdraw(WalletWithdrawAction {
+        asset: h.token.clone(),
+        amount: 100,
+    });
+    let res = h.client.try_dispatch(&stranger, &id, &action);
+    assert_eq!(res, Err(Ok(Error::UnauthorizedDispatch)));
+}
+
+#[test]
+fn dispatch_frozen_wallet_blocks_transfer() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+    mint(&h, &owner, 1_000);
+    h.client.deposit(&id, &owner, &h.token, &1_000);
+
+    h.client.freeze(&owner, &id);
+
+    let action = WalletAction::Transfer(WalletTransferAction {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 100,
+    });
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::WalletFrozen)));
+}
+
+#[test]
+fn dispatch_zero_amount_transfer_rejected() {
+    let h = setup();
+    let owner = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    let id = h.client.create_wallet(&owner);
+
+    let action = WalletAction::Transfer(WalletTransferAction {
+        to: recipient.clone(),
+        asset: h.token.clone(),
+        amount: 0,
+    });
+    let res = h.client.try_dispatch(&owner, &id, &action);
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
 
 // ---------------------------------------------------------------------------

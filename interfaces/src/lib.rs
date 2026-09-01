@@ -15,7 +15,7 @@
 //! and `Treasury → {Policy, Budget}` — without any contract crate depending on
 //! another contract crate at compile time.
 
-pub mod version;
+pub mod upgrade;
 
 use astroid_shared::errors::Error;
 use astroid_shared::types::ModuleKind;

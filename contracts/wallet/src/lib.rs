@@ -99,8 +99,74 @@ pub struct WalletData {
 #[contract]
 pub struct WalletContract;
 
+/// Unified wallet operation dispatched through the [`WalletContract::dispatch`]
+/// entrypoint.
+#[contracttype]
+#[derive(Clone)]
+pub enum WalletAction {
+    Transfer(WalletTransferAction),
+    Withdraw(WalletWithdrawAction),
+    Freeze,
+    Unfreeze,
+    Pause,
+    Unpause,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct WalletTransferAction {
+    pub to: Address,
+    pub asset: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct WalletWithdrawAction {
+    pub asset: Address,
+    pub amount: i128,
+}
+
 #[contractimpl]
 impl WalletContract {
+    // --- registry-gated upgrades ---
+
+    /// Record (or rotate) who may upgrade this contract and which registry
+    /// authorizes the new code. Bootstrapped by the deployer alongside
+    /// `initialize`; afterwards only the current upgrade admin may rotate it.
+    pub fn set_upgrade_authority(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        admin: soroban_sdk::Address,
+        registry: soroban_sdk::Address,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::set_authority(&env, &caller, &admin, &registry)
+    }
+
+    /// Read the recorded upgrade authority.
+    pub fn get_upgrade_authority(
+        env: soroban_sdk::Env,
+    ) -> Result<astroid_interfaces::upgrade::UpgradeAuthority, astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::get_authority(&env)
+    }
+
+    /// Replace this contract's code with `wasm_hash`.
+    ///
+    /// Two gates must pass: `caller` must be the recorded upgrade admin, and
+    /// `wasm_hash` must be approved for [`ModuleKind::Wallet`] in the registry. Any
+    /// other outcome leaves the contract running its current code.
+    pub fn upgrade(
+        env: soroban_sdk::Env,
+        caller: soroban_sdk::Address,
+        wasm_hash: soroban_sdk::BytesN<32>,
+    ) -> Result<(), astroid_shared::errors::Error> {
+        astroid_interfaces::upgrade::perform(
+            &env,
+            &caller,
+            astroid_shared::types::ModuleKind::Wallet,
+            wasm_hash,
+        )
+    }
     /// Initialize the contract with an emergency admin (may freeze wallets).
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
         if env.storage().instance().has(&DataKey::Admin) {
@@ -401,6 +467,37 @@ impl WalletContract {
         Ok(())
     }
 
+    /// Dispatch a wallet operation from an authorized caller.
+    ///
+    /// The `caller` must be one of:
+    /// - the wallet's **owner** (verified against on-chain wallet state), or
+    /// - a **registered module** for this wallet's organization, confirmed via
+    ///   the on-chain registry contract.
+    ///
+    /// This is the primary entrypoint for organizational modules (multisig,
+    /// treasury, policy, etc.) to execute wallet operations on behalf of the
+    /// organization. Direct owner calls to `transfer` / `freeze` etc. remain
+    /// available for backwards compatibility.
+    ///
+    /// # Errors
+    /// - [`Error::UnauthorizedDispatch`] if the caller is neither the owner nor
+    ///   a registered module.
+    /// - Propagates any error from the underlying wallet operation.
+    pub fn dispatch(
+        env: Env,
+        caller: Address,
+        wallet_id: u64,
+        action: WalletAction,
+    ) -> Result<(), Error> {
+        caller.require_auth();
+
+        // Authorize: caller must be the wallet owner, the wallet admin, or a
+        // registered module for this wallet's organization.
+        Self::require_registered_caller(&env, &caller, wallet_id)?;
+
+        Self::execute_dispatch(&env, wallet_id, &action)
+    }
+
     // --- views ---
 
     /// Read the role `account` effectively holds on a wallet, or `None` if it
@@ -605,6 +702,94 @@ impl WalletContract {
         env.storage()
             .instance()
             .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
+
+    /// Verify that `caller` is the wallet owner, an admin, or has at least
+    /// [`Role::Agent`] on the wallet.
+    fn require_registered_caller(env: &Env, caller: &Address, wallet_id: u64) -> Result<(), Error> {
+        let wallet = Self::load_wallet(env, wallet_id)?;
+        let admin: Option<Address> = env.storage().instance().get(&DataKey::Admin);
+        if admin.as_ref() == Some(caller) {
+            return Ok(());
+        }
+        access::require_role(env, wallet_id, &wallet.owner, caller, Role::Agent)
+            .map_err(|_| Error::UnauthorizedDispatch)
+    }
+
+    /// Execute a dispatched wallet action.
+    fn execute_dispatch(env: &Env, wallet_id: u64, action: &WalletAction) -> Result<(), Error> {
+        match action {
+            WalletAction::Transfer(WalletTransferAction { to, asset, amount }) => {
+                require_positive_amount(*amount)?;
+                let wallet = Self::load_wallet(env, wallet_id)?;
+                Self::require_active(&wallet)?;
+                Self::when_not_paused(env)?;
+                Self::debit(env, wallet_id, asset, *amount)?;
+                token::TokenClient::new(env, asset).transfer(
+                    &env.current_contract_address(),
+                    to,
+                    amount,
+                );
+                events::publish(
+                    env,
+                    events::ContractEvent::TransferExecuted {
+                        from: env.current_contract_address(),
+                        to: to.clone(),
+                        asset: asset.clone(),
+                        amount: *amount,
+                    },
+                );
+            }
+            WalletAction::Withdraw(WalletWithdrawAction { asset, amount }) => {
+                require_positive_amount(*amount)?;
+                let wallet = Self::load_wallet(env, wallet_id)?;
+                Self::require_active(&wallet)?;
+                Self::when_not_paused(env)?;
+                Self::debit(env, wallet_id, asset, *amount)?;
+                let owner = wallet.owner.clone();
+                token::TokenClient::new(env, asset).transfer(
+                    &env.current_contract_address(),
+                    &owner,
+                    amount,
+                );
+                events::publish(
+                    env,
+                    events::ContractEvent::TransferExecuted {
+                        from: env.current_contract_address(),
+                        to: owner,
+                        asset: asset.clone(),
+                        amount: *amount,
+                    },
+                );
+            }
+            WalletAction::Freeze => {
+                let mut wallet = Self::load_wallet(env, wallet_id)?;
+                wallet.state = ResourceState::Frozen;
+                Self::store_wallet(env, wallet_id, &wallet);
+                Self::emit_state(env, wallet_id, symbol_short!("frozen"));
+            }
+            WalletAction::Unfreeze => {
+                let mut wallet = Self::load_wallet(env, wallet_id)?;
+                ensure!(wallet.state == ResourceState::Frozen, Error::InvalidState);
+                wallet.state = ResourceState::Active;
+                Self::store_wallet(env, wallet_id, &wallet);
+                Self::emit_state(env, wallet_id, symbol_short!("active"));
+            }
+            WalletAction::Pause => {
+                let mut wallet = Self::load_wallet(env, wallet_id)?;
+                wallet.state = ResourceState::Paused;
+                Self::store_wallet(env, wallet_id, &wallet);
+                Self::emit_state(env, wallet_id, symbol_short!("paused"));
+            }
+            WalletAction::Unpause => {
+                let mut wallet = Self::load_wallet(env, wallet_id)?;
+                ensure!(wallet.state == ResourceState::Paused, Error::InvalidState);
+                wallet.state = ResourceState::Active;
+                Self::store_wallet(env, wallet_id, &wallet);
+                Self::emit_state(env, wallet_id, symbol_short!("active"));
+            }
+        }
+        Ok(())
     }
 }
 

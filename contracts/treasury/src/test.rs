@@ -30,11 +30,10 @@ struct Harness<'a> {
     admin: Address,
     multisig: Address,
     asset: Address,
-    _second_asset: Address,
 }
 
-/// Register a treasury plus a test SAC token, and mint `funded` of the asset to
-/// the admin so deposits move real value.
+/// Register a treasury plus a test SAC token, approve that token for routing,
+/// and mint `funded` of the asset to the admin so deposits move real value.
 fn setup(org: &str, funded: i128) -> Harness<'static> {
     let env = Env::default();
     env.mock_all_auths();
@@ -51,14 +50,10 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
 
-    let token_admin2 = Address::generate(&env);
-    let second_asset = env
-        .register_stellar_asset_contract_v2(token_admin2)
-        .address();
-
     if funded > 0 {
         token::StellarAssetClient::new(&env, &asset).mint(&admin, &funded);
     }
+    client.add_approved_asset(&admin, &asset);
 
     Harness {
         env,
@@ -66,7 +61,6 @@ fn setup(org: &str, funded: i128) -> Harness<'static> {
         admin,
         multisig,
         asset,
-        _second_asset: second_asset,
     }
 }
 
@@ -194,6 +188,7 @@ fn expired_allowance_rejected() {
         .register_stellar_asset_contract_v2(token_admin)
         .address();
     token::StellarAssetClient::new(&env, &asset).mint(&admin, &1_000);
+    client.add_approved_asset(&admin, &asset);
     client.deposit(&admin, &asset, &1_000);
 
     // Allowance already expired (expires_at in the past).
@@ -232,6 +227,7 @@ fn test_milestone_releases() {
         .address();
     let token_admin = token::StellarAssetClient::new(&env, &token);
     let token_client = token::TokenClient::new(&env, &token);
+    client.add_approved_asset(&admin, &token);
 
     let to = Address::generate(&env);
 
@@ -278,6 +274,171 @@ fn standard_events_emitted() {
     h2.client.deposit(&h2.admin, &h2.asset, &1_000);
     h2.client.withdraw(&h2.admin, &h2.asset, &recipient, &100);
     assert_event(&h2.env, "TransferExecuted");
+}
+
+// ---------------------------------------------------------------------------
+// Multi-token asset whitelist and routing validation
+// ---------------------------------------------------------------------------
+
+/// Register a second SAC token that the treasury has *not* approved, minting
+/// `funded` of it to the admin.
+fn unapproved_token(h: &Harness, funded: i128) -> Address {
+    let token_admin = Address::generate(&h.env);
+    let asset = h
+        .env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    if funded > 0 {
+        token::StellarAssetClient::new(&h.env, &asset).mint(&h.admin, &funded);
+    }
+    asset
+}
+
+#[test]
+fn governance_adds_and_removes_approved_assets() {
+    let h = setup("vault", 100);
+    // setup approved exactly one asset.
+    assert!(h.client.is_approved_asset(&h.asset));
+    assert_eq!(h.client.approved_asset_count(), 1);
+
+    let other = unapproved_token(&h, 0);
+    assert!(!h.client.is_approved_asset(&other));
+
+    h.client.add_approved_asset(&h.admin, &other);
+    assert!(h.client.is_approved_asset(&other));
+    assert_eq!(h.client.approved_asset_count(), 2);
+
+    h.client.remove_approved_asset(&h.admin, &other);
+    assert!(!h.client.is_approved_asset(&other));
+    assert_eq!(h.client.approved_asset_count(), 1);
+
+    // With nothing approved, the treasury routes nothing at all — which is
+    // also the state a freshly initialized treasury starts in.
+    h.client.remove_approved_asset(&h.admin, &h.asset);
+    assert_eq!(h.client.approved_asset_count(), 0);
+    assert_eq!(
+        h.client.try_deposit(&h.admin, &h.asset, &10),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+}
+
+#[test]
+fn whitelist_changes_are_idempotency_checked() {
+    let h = setup("vault", 0);
+    assert_eq!(
+        h.client.try_add_approved_asset(&h.admin, &h.asset),
+        Err(Ok(Error::AlreadyExists))
+    );
+    let other = unapproved_token(&h, 0);
+    assert_eq!(
+        h.client.try_remove_approved_asset(&h.admin, &other),
+        Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn only_governance_can_change_the_whitelist() {
+    let h = setup("vault", 0);
+    let intruder = Address::generate(&h.env);
+    let other = unapproved_token(&h, 0);
+
+    assert_eq!(
+        h.client.try_add_approved_asset(&intruder, &other),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(!h.client.is_approved_asset(&other));
+
+    assert_eq!(
+        h.client.try_remove_approved_asset(&intruder, &h.asset),
+        Err(Ok(Error::Unauthorized))
+    );
+    assert!(h.client.is_approved_asset(&h.asset));
+}
+
+#[test]
+fn deposit_of_an_unapproved_asset_is_refused() {
+    let h = setup("vault", 0);
+    let rogue = unapproved_token(&h, 1_000);
+
+    let res = h.client.try_deposit(&h.admin, &rogue, &500);
+    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    // The rogue token contract was never invoked: no value moved.
+    assert_eq!(
+        token::TokenClient::new(&h.env, &rogue).balance(&h.admin),
+        1_000
+    );
+    assert_eq!(h.client.holding(&rogue).total_in, 0);
+}
+
+#[test]
+fn withdraw_of_an_unapproved_asset_is_refused() {
+    let h = setup("vault", 1_000);
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    let recipient = Address::generate(&h.env);
+
+    // Revoking approval closes the route without touching the accounting.
+    h.client.remove_approved_asset(&h.admin, &h.asset);
+    let res = h.client.try_withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    assert_eq!(token_balance(&h, &recipient), 0);
+    assert_eq!(token_balance(&h, &h.client.address), 1_000);
+    assert_eq!(h.client.holding(&h.asset).total_in, 1_000);
+
+    // Re-approving restores it.
+    h.client.add_approved_asset(&h.admin, &h.asset);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 100);
+}
+
+#[test]
+fn budget_envelopes_cannot_be_bound_to_unapproved_assets() {
+    let h = setup("vault", 0);
+    let rogue = unapproved_token(&h, 0);
+    let res = h
+        .client
+        .try_allocate_budget(&h.admin, &rogue, &String::from_str(&h.env, "maint"));
+    assert_eq!(res, Err(Ok(Error::AssetNotAuthorized)));
+    assert_eq!(h.client.holding(&rogue).budget_id, None);
+}
+
+#[test]
+fn multiple_approved_assets_route_independently() {
+    let h = setup("vault", 1_000);
+    let second = unapproved_token(&h, 500);
+    h.client.add_approved_asset(&h.admin, &second);
+    let recipient = Address::generate(&h.env);
+
+    h.client.deposit(&h.admin, &h.asset, &1_000);
+    h.client.deposit(&h.admin, &second, &500);
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &400);
+    h.client.withdraw(&h.admin, &second, &recipient, &200);
+
+    assert_eq!(h.client.holding(&h.asset).total_out, 400);
+    assert_eq!(h.client.holding(&second).total_out, 200);
+    assert_eq!(token_balance(&h, &recipient), 400);
+    assert_eq!(
+        token::TokenClient::new(&h.env, &second).balance(&recipient),
+        200
+    );
+
+    // Revoking one asset leaves the other fully usable.
+    h.client.remove_approved_asset(&h.admin, &second);
+    assert_eq!(
+        h.client.try_withdraw(&h.admin, &second, &recipient, &10),
+        Err(Ok(Error::AssetNotAuthorized))
+    );
+    h.client.withdraw(&h.admin, &h.asset, &recipient, &100);
+    assert_eq!(token_balance(&h, &recipient), 500);
+}
+
+#[test]
+fn whitelist_changes_emit_events() {
+    let h = setup("vault", 0);
+    let other = unapproved_token(&h, 0);
+    h.client.add_approved_asset(&h.admin, &other);
+    assert_event(&h.env, "TreasuryConfigUpdated");
+    h.client.remove_approved_asset(&h.admin, &other);
+    assert_event(&h.env, "TreasuryConfigUpdated");
 }
 
 /// Build one leg of a batch payout.

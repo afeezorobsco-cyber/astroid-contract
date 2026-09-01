@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 soroban-sdk = { workspace = true }
 astroid-shared = { workspace = true }
+astroid-interfaces = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
